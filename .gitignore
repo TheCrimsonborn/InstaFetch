@@ -8,3 +8,5 @@ __pycache__/
 data/
 ngrok
 resume
+node_modules/
+frontend-dist/

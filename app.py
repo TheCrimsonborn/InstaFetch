@@ -11,10 +11,12 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import wraps
+from pathlib import Path
 from typing import Any, Iterator
 
 import requests
-from flask import Flask, Response, abort, jsonify, request
+from flask import Flask, Response, abort, jsonify, request, send_from_directory, session
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from waitress import serve
@@ -58,6 +60,11 @@ class Config:
     log_level: str
     state_db_path: str
     webhook_path: str
+    admin_base_path: str
+    admin_username: str
+    admin_password: str
+    admin_session_secret: str
+    admin_cookie_secure: bool
     discord_mention: str | None
     meta_app_secret: str | None
     meta_webhook_verify_token: str | None
@@ -83,6 +90,9 @@ def load_config() -> Config:
         "INSTAGRAM_ACCESS_TOKEN": os.getenv("INSTAGRAM_ACCESS_TOKEN", "").strip(),
         "INSTAGRAM_IG_USER_ID": os.getenv("INSTAGRAM_IG_USER_ID", "").strip(),
         "DISCORD_WEBHOOK_URL": os.getenv("DISCORD_WEBHOOK_URL", "").strip(),
+        "ADMIN_USERNAME": os.getenv("ADMIN_USERNAME", "").strip(),
+        "ADMIN_PASSWORD": os.getenv("ADMIN_PASSWORD", "").strip(),
+        "ADMIN_SESSION_SECRET": os.getenv("ADMIN_SESSION_SECRET", "").strip(),
     }
     missing = [name for name, value in required.items() if not value]
     if missing:
@@ -99,6 +109,11 @@ def load_config() -> Config:
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         state_db_path=os.getenv("STATE_DB_PATH", "/data/state.db"),
         webhook_path=normalize_webhook_path(os.getenv("WEBHOOK_PATH", "/meta/webhook")),
+        admin_base_path=normalize_webhook_path(os.getenv("ADMIN_BASE_PATH", "/admin")),
+        admin_username=required["ADMIN_USERNAME"],
+        admin_password=required["ADMIN_PASSWORD"],
+        admin_session_secret=required["ADMIN_SESSION_SECRET"],
+        admin_cookie_secure=parse_bool(os.getenv("ADMIN_COOKIE_SECURE", "true")),
         discord_mention=(os.getenv("DISCORD_MENTION") or "").strip() or None,
         meta_app_secret=os.getenv("META_APP_SECRET") or None,
         meta_webhook_verify_token=os.getenv("META_WEBHOOK_VERIFY_TOKEN") or None,
@@ -134,6 +149,41 @@ class StateStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sync_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trigger_type TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    processed_count INTEGER DEFAULT 0,
+                    sent_count INTEGER DEFAULT 0,
+                    status TEXT NOT NULL,
+                    error_message TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            self._ensure_column(conn, "sent_media", "media_type", "TEXT")
+            self._ensure_column(conn, "sent_media", "caption", "TEXT")
+            self._ensure_column(conn, "sent_media", "permalink", "TEXT")
+            self._ensure_column(conn, "sent_media", "media_url", "TEXT")
+            self._ensure_column(conn, "sent_media", "thumbnail_url", "TEXT")
+            self._ensure_column(conn, "sent_media", "username", "TEXT")
+            self._ensure_column(conn, "sent_media", "media_timestamp", "TEXT")
+
+    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        existing = {row["name"] for row in rows}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def was_sent(self, media_id: str) -> bool:
         with self.connect() as conn:
@@ -143,15 +193,113 @@ class StateStore:
             ).fetchone()
         return row is not None
 
-    def mark_sent(self, media_id: str, media_product_type: str) -> None:
+    def mark_sent(self, media: dict[str, Any]) -> None:
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO sent_media (media_id, media_product_type, sent_at)
+                INSERT OR REPLACE INTO sent_media (
+                    media_id,
+                    media_product_type,
+                    media_type,
+                    caption,
+                    permalink,
+                    media_url,
+                    thumbnail_url,
+                    username,
+                    media_timestamp,
+                    sent_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    media["id"],
+                    media.get("media_product_type") or "UNKNOWN",
+                    media.get("media_type"),
+                    media.get("caption"),
+                    media.get("permalink"),
+                    media.get("media_url"),
+                    media.get("thumbnail_url"),
+                    media.get("username"),
+                    media.get("timestamp"),
+                    utc_now_iso(),
+                ),
+            )
+
+    def start_sync_run(self, trigger_type: str) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO sync_runs (trigger_type, started_at, status)
                 VALUES (?, ?, ?)
                 """,
-                (media_id, media_product_type, utc_now_iso()),
+                (trigger_type, utc_now_iso(), "running"),
             )
+            return int(cursor.lastrowid)
+
+    def complete_sync_run(
+        self,
+        run_id: int,
+        *,
+        processed_count: int,
+        sent_count: int,
+        status: str,
+        error_message: str | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE sync_runs
+                SET completed_at = ?, processed_count = ?, sent_count = ?, status = ?, error_message = ?
+                WHERE id = ?
+                """,
+                (utc_now_iso(), processed_count, sent_count, status, error_message, run_id),
+            )
+
+    def set_state(self, key: str, value: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
+
+    def get_state(self, key: str) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM app_state WHERE key = ? LIMIT 1",
+                (key,),
+            ).fetchone()
+        return row["value"] if row else None
+
+    def get_recent_sent_media(self, limit: int = 12) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT media_id, media_product_type, media_type, caption, permalink,
+                       media_url, thumbnail_url, username, media_timestamp, sent_at
+                FROM sent_media
+                ORDER BY datetime(sent_at) DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_latest_sync_run(self) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, trigger_type, started_at, completed_at, processed_count,
+                       sent_count, status, error_message
+                FROM sync_runs
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row else None
 
 
 class InstagramClient:
@@ -272,33 +420,50 @@ class SyncService:
     def trigger_sync(self) -> None:
         self.force_run_event.set()
 
-    def sync_once(self) -> dict[str, int]:
-        media_items = self.instagram.fetch_recent_media(self.config.backfill_limit)
-        story_items = self.instagram.fetch_recent_stories(self.config.backfill_limit)
-        by_id = {item["id"]: item for item in media_items}
-        by_id.update({item["id"]: item for item in story_items})
-        media_items = list(by_id.values())
-        media_items.sort(key=lambda item: item.get("timestamp", ""))
-
+    def sync_once(self, trigger_type: str = "manual") -> dict[str, int]:
+        run_id = self.state.start_sync_run(trigger_type)
         processed = 0
         sent = 0
-        for media in media_items:
-            media_id = media["id"]
-            processed += 1
-            if self.state.was_sent(media_id):
-                continue
-            self.discord.send_media(media)
-            self.state.mark_sent(media_id, media.get("media_product_type") or "UNKNOWN")
-            sent += 1
-            self.logger.info("Sent media %s to Discord", media_id)
+        try:
+            media_items = self.instagram.fetch_recent_media(self.config.backfill_limit)
+            story_items = self.instagram.fetch_recent_stories(self.config.backfill_limit)
+            by_id = {item["id"]: item for item in media_items}
+            by_id.update({item["id"]: item for item in story_items})
+            media_items = list(by_id.values())
+            media_items.sort(key=lambda item: item.get("timestamp", ""))
 
-        return {"processed": processed, "sent": sent}
+            for media in media_items:
+                media_id = media["id"]
+                processed += 1
+                if self.state.was_sent(media_id):
+                    continue
+                self.discord.send_media(media)
+                self.state.mark_sent(media)
+                sent += 1
+                self.logger.info("Sent media %s to Discord", media_id)
+
+            self.state.complete_sync_run(
+                run_id,
+                processed_count=processed,
+                sent_count=sent,
+                status="success",
+            )
+            return {"processed": processed, "sent": sent}
+        except Exception as exc:
+            self.state.complete_sync_run(
+                run_id,
+                processed_count=processed,
+                sent_count=sent,
+                status="failed",
+                error_message=str(exc),
+            )
+            raise
 
     def _run_loop(self) -> None:
         self.logger.info("Background sync loop started")
         while not self.stop_event.is_set():
             try:
-                result = self.sync_once()
+                result = self.sync_once(trigger_type="scheduler")
                 self.logger.info("Sync finished processed=%s sent=%s", result["processed"], result["sent"])
             except Exception:
                 self.logger.exception("Sync loop failed")
@@ -393,9 +558,68 @@ def normalize_webhook_path(path: str) -> str:
     return normalized.rstrip("/") or "/"
 
 
+def parse_bool(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_admin_authenticated() -> bool:
+    return bool(session.get("admin_authenticated"))
+
+
+def admin_required(route_handler: Any) -> Any:
+    @wraps(route_handler)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if not is_admin_authenticated():
+            return jsonify({"error": "Unauthorized"}), 401
+        return route_handler(*args, **kwargs)
+
+    return wrapper
+
+
+def mask_secret(value: str | None) -> str:
+    if not value:
+        return "missing"
+    if len(value) < 10:
+        return "*" * len(value)
+    return f"{value[:4]}...{value[-4:]}"
+
+
+def build_webhook_summary(config: Config, state: StateStore) -> dict[str, Any]:
+    last_webhook = state.get_state("last_webhook_received_at")
+    return {
+        "path": config.webhook_path,
+        "verify_token_configured": bool(config.meta_webhook_verify_token),
+        "app_secret_configured": bool(config.meta_app_secret),
+        "last_received_at": last_webhook,
+        "status": "ready" if config.meta_webhook_verify_token else "incomplete",
+    }
+
+
+def build_dashboard_payload(config: Config, state: StateStore) -> dict[str, Any]:
+    return {
+        "service": {
+            "poll_interval_seconds": config.poll_interval_seconds,
+            "backfill_limit": config.backfill_limit,
+            "admin_base_path": config.admin_base_path,
+            "ig_user_id": config.instagram_ig_user_id,
+            "token_hint": mask_secret(config.instagram_access_token),
+            "mention": config.discord_mention or "disabled",
+        },
+        "sync": state.get_latest_sync_run(),
+        "recent_media": state.get_recent_sent_media(12),
+        "webhook": build_webhook_summary(config, state),
+    }
+
+
 def create_app(config: Config, sync_service: SyncService) -> Flask:
     app = Flask(__name__)
     logger = logging.getLogger("http")
+    frontend_dist = Path(__file__).resolve().parent / "frontend-dist"
+    frontend_assets = frontend_dist / "assets"
+    app.secret_key = config.admin_session_secret
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+    app.config["SESSION_COOKIE_SECURE"] = config.admin_cookie_secure
 
     @app.get("/health")
     def health() -> Response:
@@ -424,6 +648,7 @@ def create_app(config: Config, sync_service: SyncService) -> Flask:
 
         payload = request.get_json(silent=True) or {}
         logger.info("Received Meta webhook: %s", json.dumps(payload, ensure_ascii=True))
+        sync_service.state.set_state("last_webhook_received_at", utc_now_iso())
 
         # Instagram's official webhooks do not publish "new media created" events.
         # We still trigger an immediate sync so supported events can reduce latency.
@@ -432,8 +657,57 @@ def create_app(config: Config, sync_service: SyncService) -> Flask:
 
     @app.post("/sync")
     def sync_now() -> Response:
-        result = sync_service.sync_once()
+        result = sync_service.sync_once(trigger_type="manual")
         return jsonify(result)
+
+    if frontend_dist.exists():
+        @app.get(f"{config.admin_base_path}/api/auth/me")
+        def admin_auth_me() -> Response:
+            if not is_admin_authenticated():
+                return jsonify({"authenticated": False}), 401
+            return jsonify({"authenticated": True, "username": config.admin_username})
+
+        @app.post(f"{config.admin_base_path}/api/auth/login")
+        def admin_auth_login() -> Response:
+            payload = request.get_json(silent=True) or {}
+            username = (payload.get("username") or "").strip()
+            password = payload.get("password") or ""
+            if username != config.admin_username or password != config.admin_password:
+                return jsonify({"error": "Invalid credentials"}), 401
+            session.clear()
+            session["admin_authenticated"] = True
+            session["admin_username"] = config.admin_username
+            return jsonify({"authenticated": True, "username": config.admin_username})
+
+        @app.post(f"{config.admin_base_path}/api/auth/logout")
+        def admin_auth_logout() -> Response:
+            session.clear()
+            return jsonify({"authenticated": False})
+
+        @app.get(f"{config.admin_base_path}/api/dashboard")
+        @admin_required
+        def admin_dashboard() -> Response:
+            return jsonify(build_dashboard_payload(config, sync_service.state))
+
+        @app.post(f"{config.admin_base_path}/api/sync")
+        @admin_required
+        def admin_sync() -> Response:
+            result = sync_service.sync_once(trigger_type="manual")
+            payload = build_dashboard_payload(config, sync_service.state)
+            payload["manual_sync_result"] = result
+            return jsonify(payload)
+
+        @app.get(config.admin_base_path)
+        def admin_index() -> Response:
+            return send_from_directory(frontend_dist, "index.html")
+
+        @app.get(f"{config.admin_base_path}/<path:asset_path>")
+        def admin_assets(asset_path: str) -> Response:
+            if asset_path.startswith("assets/"):
+                return send_from_directory(frontend_assets, asset_path.removeprefix("assets/"))
+            if asset_path == "favicon.ico":
+                return send_from_directory(frontend_dist, asset_path)
+            return send_from_directory(frontend_dist, "index.html")
 
     return app
 
