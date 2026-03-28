@@ -1,0 +1,32 @@
+services:
+  app:
+    build:
+      context: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      STATE_DB_PATH: /data/state.db
+      PORT: 8080
+      WEBHOOK_PATH: /meta/webhook
+    volumes:
+      - app-data:/data
+    expose:
+      - "8080"
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    command:
+      - http
+      - app:8080
+    ports:
+      - "127.0.0.1:4040:4040"
+
+volumes:
+  app-data:
